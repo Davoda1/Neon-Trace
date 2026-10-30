@@ -1,0 +1,97 @@
+name: Native builds and focused checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: ${{ matrix.os }} native
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-0 libx11-xcb1 libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libvulkan1 mesa-vulkan-drivers
+      - name: Install stable pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+      - name: Windows SDK resource compiler
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Focused unit tests
+        run: cargo test --release --locked
+      - name: Native release executable
+        run: cargo build --release --locked
+      - name: Verify official live data services
+        if: runner.os == 'Linux'
+        run: ./target/release/neontrace --verify-data
+      - name: Linux native interface and exports
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb dbus-x11 imagemagick tesseract-ocr python3-venv python3-pil libxtst6
+          /usr/bin/python3 -m venv --system-site-packages /tmp/neontrace-qa-env
+          /tmp/neontrace-qa-env/bin/pip install dbus-next==0.2.3
+          /tmp/neontrace-qa-env/bin/python tools/ui_smoke.py target/release/neontrace --out ui-qa
+      - name: Windows native interface and OS preference
+        if: runner.os == 'Windows'
+        run: python tools/windows_ui_smoke.py --exe target/release/neontrace.exe --output windows-ui-qa
+      - name: Download locked crate notice sources
+        run: cargo fetch --locked
+      - name: Collect compiled dependency notices
+        run: python tools/dependency_notices.py
+      - name: Linux runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          ldd target/release/neontrace > native-dependencies.txt
+          readelf --version-info target/release/neontrace >> native-dependencies.txt
+      - name: Windows runtime imports
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: dumpbin /dependents target\release\neontrace.exe > native-dependencies.txt
+      - name: Retain private interface verification
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: neontrace-interface-verification
+          path: ui-qa
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Retain private Windows interface verification
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: neontrace-windows-interface-verification
+          path: windows-ui-qa
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Retain private native build
+        uses: actions/upload-artifact@v4
+        with:
+          name: neontrace-${{ runner.os }}
+          path: |
+            target/release/neontrace
+            target/release/neontrace.exe
+            docs/THIRD-PARTY-NOTICES.txt
+            native-dependencies.txt
+          if-no-files-found: error
+          retention-days: 7

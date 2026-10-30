@@ -1,0 +1,9 @@
+/target/
+/dist/
+*.part
+*.log
+!.github/**
+
+
+__pycache__/
+*.pyc
