@@ -182,7 +182,13 @@ class X11:
     def click(self,window,x,y,button=1):
         wx,wy,_,_=self.geometry(window)
         self.t.XTestFakeMotionEvent(self.d,0,wx+int(x),wy+int(y),0)
+        self.x.XSync(self.d,0)
+        # Let native pointer tracking settle before pressing, especially after
+        # opening a modal or resizing the client area on software rendering.
+        time.sleep(0.12)
         self.t.XTestFakeButtonEvent(self.d,button,1,0)
+        self.x.XSync(self.d,0)
+        time.sleep(0.06)
         self.t.XTestFakeButtonEvent(self.d,button,0,0)
         self.x.XSync(self.d,0)
         time.sleep(0.35)
@@ -272,8 +278,16 @@ def main():
             active.remove(p)
             time.sleep(0.1)
         def shot(window,name):
-            result=screenshot(window,out/name,env);report['screenshots'].append(result)
-            if result['colors']<30: raise RuntimeError(f'Screenshot looks blank: {name}')
+            # A mapped native window can precede the first GPU presentation.
+            # Wait for rendered content instead of accepting or failing a black
+            # startup frame based on a fixed sleep.
+            until=time.monotonic()+10
+            while True:
+                result=screenshot(window,out/name,env)
+                if result['colors']>=30: break
+                if time.monotonic()>=until: raise RuntimeError(f'Screenshot looks blank: {name}')
+                time.sleep(0.2)
+            report['screenshots'].append(result)
             return result
         # Startup dark scheme and live preference change on the same native app.
         p,window=launch('en',1280,800,'english-wide')
@@ -284,9 +298,10 @@ def main():
         if not report['checks']['live_os_theme_changed']: raise RuntimeError('Native window did not visibly follow the portal light-theme change')
         state.with_suffix('.next').write_text('1');state.with_suffix('.next').replace(state);time.sleep(0.4)
         click_word(x11,window,'Settings',out,env);shot(window,'english-settings-1280x800.png')
-        # Real application exports, with only the external file chooser simulated.
+        click_word(x11,window,'Close',out,env)
+        # Real application exports from their dedicated dialog.
         for extension in ['PNG','JSON','CSV']:
-            if extension!='PNG': click_word(x11,window,'Settings',out,env)
+            click_word(x11,window,'Export',out,env)
             before=set((out/'exports').glob('*.'+extension.lower()))
             click_word(x11,window,extension,out,env)
             new=wait_for(lambda:next((f for f in (out/'exports').glob('*.'+extension.lower()) if f not in before and f.stat().st_size>0),None),15)
@@ -302,7 +317,7 @@ def main():
                 click_word(x11,window,'Close',out,env)
                 click_word(x11,window,'Settings',out,env);shot(window,'english-settings-680x540.png')
                 click_word(x11,window,'Close',out,env)
-                click_word(x11,window,'Multiple',out,env);shot(window,'english-targets-680x540.png')
+                click_word(x11,window,'Targets',out,env);shot(window,'english-targets-680x540.png')
             stop(p)
         p,window=launch('ru',1440,960,'russian-150pct',scale='1.5')
         shot(window,'russian-150pct-1440x960.png');report['checks']['high_dpi_150pct_captured']=True;stop(p)

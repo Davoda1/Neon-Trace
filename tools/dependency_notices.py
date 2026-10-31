@@ -9,6 +9,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,7 +40,8 @@ def main():
         result = subprocess.run([args.cargo, "metadata", "--locked", "--offline", "--format-version", "1", "--filter-platform", platform], cwd=ROOT, check=True, capture_output=True, text=True)
         metadata = json.loads(result.stdout)
         packages_by_id.update((p["id"], p) for p in metadata["packages"])
-    sections = ["NEONTRACE 1.0.0 — THIRD-PARTY NOTICES\n\n" + (ROOT / "LICENSE").read_text(encoding="utf-8")]
+    version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+    sections = [f"NEONTRACE {version} — THIRD-PARTY NOTICES\n\n" + (ROOT / "LICENSE").read_text(encoding="utf-8")]
     if not args.map_license.is_file():
         raise ValueError("Original Simplemaps MIT notice must exist before packaging")
     sections.append("SELECTED WORLD MAP\nSource: https://simplemaps.com/resources/svg-world\nRobinson world-o2.svg; original geometry retained.\n\n" + args.map_license.read_text(encoding="utf-8"))

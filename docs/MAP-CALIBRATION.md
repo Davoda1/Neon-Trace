@@ -24,8 +24,15 @@ coasts, accurate city coordinates can fall just outside a simplified polygon;
 for example Wellington is about 4.33 source units offshore in this asset and
 Reykjavík about 0.91. Coordinates are never snapped to land.
 
-The production renderer uniformly fits the complete original 2000 × 857 map
-inside its available area, including glow padding. Unsupported latitude values
+The renderer uses one uniform geographic scale. With no located route, it fits
+the complete original 2000 × 857 map inside the available area with glow padding.
+Located routes receive automatic framing with context padding and a four-times
+world-fit zoom cap. Ctrl + scroll provides pointer-centered manual zoom from
+one to twelve times world fit; Ctrl + drag pans. Horizontal copies wrap around
+the atlas, while vertical movement is bounded. Fit route restores the automatic
+camera. Marker hit testing uses the same transformation as drawing.
+
+Unsupported latitude values
 below −60° or above +84°, invalid coordinates, and projected positions outside
 the actual asset rectangle remain explicitly unlocated. Antarctica is absent.
 Dateline-crossing schematic connections split at ±180° and the two portions

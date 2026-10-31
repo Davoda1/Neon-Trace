@@ -3,6 +3,7 @@ name: Native builds and focused checks
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -23,6 +24,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-0 libx11-xcb1 libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libvulkan1 mesa-vulkan-drivers
@@ -38,10 +42,15 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
       - name: Formatting
         run: cargo fmt --check
+      - name: Packaging regression checks
+        run: python -m unittest discover -s tools -p "test_package.py" -v
       - name: Focused unit tests
         run: cargo test --release --locked
       - name: Native release executable
         run: cargo build --release --locked
+      - name: Verify complete source distribution
+        if: runner.os == 'Linux'
+        run: python tools/package.py --verify-source-build
       - name: Verify official live data services
         if: runner.os == 'Linux'
         run: ./target/release/neontrace --verify-data
@@ -68,7 +77,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: dumpbin /dependents target\release\neontrace.exe > native-dependencies.txt
-      - name: Retain private interface verification
+      - name: Retain interface verification
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
@@ -76,7 +85,7 @@ jobs:
           path: ui-qa
           if-no-files-found: ignore
           retention-days: 7
-      - name: Retain private Windows interface verification
+      - name: Retain Windows interface verification
         if: always() && runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
@@ -84,7 +93,7 @@ jobs:
           path: windows-ui-qa
           if-no-files-found: ignore
           retention-days: 7
-      - name: Retain private native build
+      - name: Retain native build
         uses: actions/upload-artifact@v4
         with:
           name: neontrace-${{ runner.os }}
@@ -95,3 +104,108 @@ jobs:
             native-dependencies.txt
           if-no-files-found: error
           retention-days: 7
+
+  publish:
+    name: Package and publish release
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: native
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version), 'Expected a stable semantic version'
+          assert os.environ['RELEASE_TAG'] == f'v{version}', 'Tag and Cargo version differ'
+          assert Path(f'docs/releases/{version}.md').is_file(), 'Release notes are missing'
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'RELEASE_VERSION={version}\n')
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: neontrace-Linux
+          path: native/linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: neontrace-Windows
+          path: native/windows
+      - name: Package native executables and complete source
+        run: |
+          cp native/linux/docs/THIRD-PARTY-NOTICES.txt docs/THIRD-PARTY-NOTICES.txt
+          python tools/package.py \
+            --linux native/linux/target/release/neontrace \
+            --windows native/windows/target/release/neontrace.exe \
+            --version "$RELEASE_VERSION" --output dist
+          cd dist
+          sha256sum --check SHA256SUM.txt
+      - name: Upload complete draft release assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > release-draft.txt 2>/dev/null; then
+            if [ "$(cat release-draft.txt)" != "true" ]; then
+              echo "This release is already published; keeping its existing assets."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "NeonTrace $RELEASE_VERSION" \
+              --notes-file "docs/releases/$RELEASE_VERSION.md"
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release view "$RELEASE_TAG" --json assets > release-assets.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          expected = {p.name: p.stat().st_size for p in Path('dist').iterdir() if p.is_file()}
+          actual = {a['name']: a['size'] for a in json.loads(Path('release-assets.json').read_text())['assets']}
+          assert len(expected) == 8 and actual == expected, 'Uploaded release assets are incomplete'
+          PY
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      - name: Fast-forward master when permitted
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh auth setup-git
+          git fetch origin master
+          release_commit="$(git rev-parse HEAD)"
+          master_commit="$(git rev-parse origin/master)"
+          if [ "$master_commit" != "$release_commit" ]; then
+            if ! git merge-base --is-ancestor "$master_commit" "$release_commit"; then
+              echo "::warning::master has advanced beyond this release; it will not be overwritten."
+              echo "master was not changed because it has advanced beyond the release commit." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if ! git push origin "$release_commit:refs/heads/master"; then
+              echo "::warning::master promotion needs a maintainer with the required repository permissions."
+              echo "The tested tag is ready. A maintainer must fast-forward master to $release_commit using the repository's required permissions." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          fi
+      - name: Publish validated release
+        if: steps.assets.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false --latest

@@ -13,12 +13,27 @@ pub const MAX_HISTORY_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Outer position in physical desktop pixels, plus the scale used by logical-only backends.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WindowPosition {
+    pub x: i32,
+    pub y: i32,
+    pub scale_factor: f32,
+}
+impl WindowPosition {
+    pub fn valid(self) -> bool {
+        self.scale_factor.is_finite() && (0.5..=8.0).contains(&self.scale_factor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub language: String,
     pub window_width: f32,
     pub window_height: f32,
+    pub window_position: Option<WindowPosition>,
+    pub window_maximized: bool,
     pub sidebar_visible: bool,
     pub history_enabled: bool,
     pub tcp_check: bool,
@@ -30,6 +45,8 @@ impl Default for Config {
             language: "en".into(),
             window_width: 1280.0,
             window_height: 800.0,
+            window_position: None,
+            window_maximized: false,
             sidebar_visible: true,
             history_enabled: false,
             tcp_check: false,
@@ -42,6 +59,7 @@ impl Config {
         if !["en", "de", "hu", "fr", "it", "ru"].contains(&self.language.as_str()) {
             self.language = "en".into();
         }
+        self.window_position = self.window_position.filter(|p| p.valid());
         self.window_width = if self.window_width.is_finite() {
             self.window_width.clamp(680.0, 7680.0)
         } else {
@@ -461,6 +479,51 @@ mod tests {
         history.clear().unwrap();
         assert!(history.list().unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn legacy_settings_and_physical_window_bounds_round_trip() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"window_width":1000,"window_height":700}"#).unwrap();
+        assert!(config.window_position.is_none());
+        assert!(!config.window_maximized);
+        config.window_position = Some(WindowPosition {
+            x: -1920,
+            y: 45,
+            scale_factor: 1.5,
+        });
+        config.window_maximized = true;
+        let root = temporary("geometry");
+        let paths = Paths {
+            config_dir: root.clone(),
+            cache_dir: root.join("cache"),
+            history_dir: root.join("history"),
+        };
+        paths.save_config(&config).unwrap();
+        let restored = paths.load_config().unwrap();
+        assert_eq!(
+            (restored.window_width, restored.window_height),
+            (1000., 700.)
+        );
+        let position = restored.window_position.unwrap();
+        assert_eq!(
+            (position.x, position.y, position.scale_factor),
+            (-1920, 45, 1.5)
+        );
+        assert!(restored.window_maximized);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn invalid_window_scale_is_not_restored() {
+        let mut config = Config {
+            window_position: Some(WindowPosition {
+                x: 10,
+                y: 20,
+                scale_factor: 0.0,
+            }),
+            ..Default::default()
+        };
+        config.normalize();
+        assert!(config.window_position.is_none());
     }
     #[test]
     fn config_normalizes_unsupported_values_without_target_state() {

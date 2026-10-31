@@ -1,14 +1,19 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod appearance;
 mod demo;
+mod dialogs;
 mod export;
 mod geo;
 mod i18n;
+mod journey;
 mod map;
 mod map_view;
+mod presentation;
 mod probe;
 mod storage;
 mod target;
+mod ui;
+mod window_state;
 
 use export::{
     Diagnostic, ExportBundle, GeoPoint, Hop, HopResponse, PingSample, SampleStatus, Session,
@@ -17,7 +22,7 @@ use export::{
 use i18n::{Key as K, Language};
 use iced::widget::button as button_style;
 use iced::widget::{
-    Space, canvas, checkbox, column, container, opaque, pick_list, progress_bar, row,
+    Space, canvas, checkbox, container, opaque, pick_list, progress_bar, row,
     rule::horizontal as horizontal_rule, scrollable, stack, text, text_input,
 };
 use iced::{Color, Element, Fill, Length, Size, Subscription, Task, Theme, window};
@@ -44,6 +49,10 @@ enum Message {
     Input(String),
     Start,
     Stop,
+    Clear,
+    FitMap,
+    JourneyViewport(iced::widget::scrollable::Viewport),
+    JourneyHover(bool),
     Retrace,
     Replay,
     Pause,
@@ -55,8 +64,14 @@ enum Message {
     RemoveTarget(usize),
     ApplyTargets,
     Select(usize),
+    MapSelected(map_view::MapEvent),
+    InspectorTab(bool),
+    FocusMap,
+    DetailToggle,
+    OpenExport,
     Settings,
     About,
+    Licenses,
     History,
     CloseModal,
     Language(Language),
@@ -78,6 +93,8 @@ enum Message {
     Copy(String),
     Theme(iced::theme::Mode),
     Window((window::Id, window::Event)),
+    WindowRestored,
+    WindowCaptured(window::Id, u64, window_state::Snapshot),
     Keyboard(iced::keyboard::Event),
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -85,8 +102,10 @@ enum Modal {
     Targets,
     Settings,
     About,
+    Licenses,
     History,
     Details,
+    Export,
 }
 struct Animation {
     start: Instant,
@@ -109,19 +128,22 @@ impl Animation {
         animation
     }
     fn smooth(&self, now: Instant) -> f32 {
-        (self
+        // Keep the clock monotonic across pauses and repeat the presentation.
+        // Take the remainder before converting to floating point so long-running
+        // sessions retain sub-frame precision. This clock never triggers probes.
+        let elapsed = self
             .paused
             .unwrap_or(now)
             .saturating_duration_since(self.start)
-            .saturating_sub(self.pause_total)
-            .as_secs_f32()
-            / JOURNEY.as_secs_f32())
-        .clamp(0.0, 1.0)
+            .saturating_sub(self.pause_total);
+        (elapsed.as_nanos() % JOURNEY.as_nanos()) as f32 / JOURNEY.as_nanos() as f32
     }
     fn toggle(&mut self) {
-        let now = Instant::now();
+        self.toggle_at(Instant::now());
+    }
+    fn toggle_at(&mut self, now: Instant) {
         if let Some(at) = self.paused.take() {
-            self.pause_total += now - at
+            self.pause_total += now.saturating_duration_since(at)
         } else {
             self.paused = Some(now)
         }
@@ -181,18 +203,24 @@ struct App {
     selected: usize,
     animations: HashMap<u64, Animation>,
     presentation_paused: bool,
+    journey_follow: journey::Follow,
     routes: Vec<RouteVisual>,
     cache: MapCache,
+    map_reset_epoch: u64,
+    selected_map_node: Option<(u64, usize)>,
+    show_hops: bool,
+    expanded_details: bool,
+    focus_map: bool,
     modal: Option<Modal>,
     fields: Vec<String>,
     field_errors: Vec<Option<K>>,
     status: K,
-    detail: String,
+    geo_error: Option<String>,
     dark: bool,
     now: Instant,
     window_id: Option<window::Id>,
     history_entries: Vec<storage::HistoryEntry>,
-    last_config_save: Instant,
+    window_state: window_state::State,
     last_geo_check: Instant,
     #[cfg(windows)]
     last_theme_check: Instant,
@@ -232,6 +260,7 @@ impl App {
             K::DownloadOnFirstUse
         };
         let (geo_tx, geo_rx) = mpsc::sync_channel(32);
+        let window_state = window_state::State::new(&config);
         let mut app = Self {
             paths,
             storage_available,
@@ -260,7 +289,7 @@ impl App {
             retained_demo: None,
             route_ids: HashMap::new(),
             fatal_status: HashMap::new(),
-            multi_targets: vec!["example.com".into()],
+            multi_targets: vec![String::new()],
             multi: false,
             input: String::new(),
             running: false,
@@ -269,18 +298,24 @@ impl App {
             selected: 0,
             animations: HashMap::new(),
             presentation_paused: false,
+            journey_follow: journey::Follow::default(),
             routes: Vec::new(),
             cache: MapCache::default(),
+            map_reset_epoch: 0,
+            selected_map_node: None,
+            show_hops: false,
+            expanded_details: false,
+            focus_map: false,
             modal: None,
             fields: vec![String::new()],
             field_errors: vec![None],
             status: K::Idle,
-            detail: String::new(),
+            geo_error: None,
             dark: true,
             now: Instant::now(),
             window_id: None,
             history_entries: Vec::new(),
-            last_config_save: Instant::now(),
+            window_state,
             last_geo_check: Instant::now(),
             #[cfg(windows)]
             last_theme_check: Instant::now(),
@@ -289,8 +324,19 @@ impl App {
         };
         if std::env::args().any(|a| a == "--demo") {
             app.demonstration = true;
-            app.sessions = demo::sessions(1);
+            let count = std::env::args()
+                .find_map(|a| {
+                    a.strip_prefix("--demo-targets=")
+                        .and_then(|n| n.parse::<usize>().ok())
+                })
+                .unwrap_or(1)
+                .clamp(1, 10);
+            app.sessions = demo::sessions(count);
+            app.multi = count > 1;
+            app.multi_targets = app.sessions.iter().map(|s| s.target.clone()).collect();
+            app.retained_single = demo::sessions(1);
             app.replay();
+            app.input = app.sessions[0].target.clone();
             app.status = K::DemoWarning;
         }
         (app, iced::system::theme().map(Message::Theme))
@@ -340,10 +386,13 @@ impl App {
             return;
         }
         self.config.language = self.language.code().into();
-        if self.paths.save_config(&self.config).is_err() {
+        if self
+            .paths
+            .save_config(&self.window_state.saved_config(&self.config))
+            .is_err()
+        {
             self.status = K::StorageError;
         }
-        self.last_config_save = Instant::now();
     }
     fn bundle(&self) -> ExportBundle {
         ExportBundle {
@@ -378,8 +427,69 @@ impl App {
             self.save_history();
         }
     }
+    fn clear_view(&mut self) {
+        // Clearing is an explicit presentation reset after measurement stops.
+        // User preferences, saved history and installed databases are retained.
+        if self.running {
+            return;
+        }
+        if let Some(manager) = &mut self.manager {
+            manager.stop();
+        }
+        self.geo_cancel.store(true, Ordering::Release);
+        self.geo_cancel = Arc::new(AtomicBool::new(false));
+        self.geo_epoch = self.geo_epoch.wrapping_add(1);
+        self.geo_lookup_revision = self.geo_lookup_revision.wrapping_add(1);
+        // Give the next operation a fresh progress channel; cancelled workers
+        // must not change the newly cleared UI with a late progress event.
+        let (tx, rx) = mpsc::sync_channel(32);
+        self.geo_tx = tx;
+        self.geo_rx = rx;
+        self.geo_busy = false;
+        self.geo_lookup_busy = false;
+        self.geo_bytes = None;
+        self.geo_error = None;
+        self.geo_status = if self.geo.as_ref().is_some_and(|g| g.ready()) {
+            K::DatabaseReady
+        } else {
+            K::DownloadOnFirstUse
+        };
+        self.pending_geo.clear();
+        self.location_cache.clear();
+        self.origins_requested.clear();
+        self.origin4 = None;
+        self.origin6 = None;
+        self.network_signature = None;
+        self.sessions.clear();
+        self.retained_single.clear();
+        self.retained_demo = None;
+        self.route_ids.clear();
+        self.fatal_status.clear();
+        self.input.clear();
+        self.multi_targets = vec![String::new()];
+        self.multi = false;
+        self.demonstration = false;
+        self.saved = false;
+        self.selected = 0;
+        self.animations.clear();
+        self.routes.clear();
+        self.presentation_paused = false;
+        self.journey_follow = journey::Follow::default();
+        self.selected_map_node = None;
+        self.show_hops = false;
+        self.expanded_details = false;
+        self.focus_map = false;
+        self.fields = vec![String::new()];
+        self.field_errors = vec![None];
+        self.history_entries.clear();
+        self.modal = None;
+        self.status = K::Idle;
+        self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
+        self.cache.clear();
+    }
     fn replay(&mut self) {
         self.presentation_paused = false;
+        self.journey_follow.restart();
         self.animations.clear();
         for s in &self.sessions {
             self.animations
@@ -401,6 +511,7 @@ impl App {
         self.last_geo_check = Instant::now();
         self.geo_busy = true;
         self.geo_status = K::CheckingUpdates;
+        self.geo_error = None;
         self.geo_bytes = None;
         let cancel = self.geo_cancel.clone();
         let tx = self.geo_tx.clone();
@@ -411,7 +522,7 @@ impl App {
                     .refresh(force, cancel, Some(tx))
                     .await
                     .map(|_| ())
-                    .map_err(|e| e.code.to_string())
+                    .map_err(|e| e.to_string())
             },
             move |r| Message::GeoDone(epoch, r),
         )
@@ -437,7 +548,9 @@ impl App {
         )
     }
     fn start(&mut self) -> Task<Message> {
+        self.selected_map_node = None;
         if self.demonstration {
+            self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
             self.sessions = demo::sessions(if self.multi {
                 self.multi_targets.len()
             } else {
@@ -479,6 +592,7 @@ impl App {
                 return Task::none();
             }
         };
+        self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
         self.sessions = targets
             .iter()
             .zip(gens)
@@ -498,7 +612,7 @@ impl App {
         self.fatal_status.clear();
         self.routes.clear();
         self.status = K::Resolving;
-        self.detail.clear();
+        self.geo_error = None;
         self.geo_epoch = self.geo_epoch.wrapping_add(1);
         self.geo_cancel.store(true, Ordering::Release);
         self.geo_cancel = Arc::new(AtomicBool::new(false));
@@ -923,6 +1037,13 @@ impl App {
         Task::none()
     }
     fn rebuild_routes(&mut self) {
+        let selected_location = self.selected_map_node.and_then(|(id, index)| {
+            self.routes
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.nodes.get(index))
+                .map(|n| (id, n.lat, n.lon, n.label.clone()))
+        });
         self.routes = self
             .sessions
             .iter()
@@ -999,6 +1120,18 @@ impl App {
                 }
             })
             .collect();
+        self.selected_map_node = selected_location.and_then(|(id, lat, lon, label)| {
+            self.routes.iter().find(|r| r.id == id).and_then(|r| {
+                r.nodes
+                    .iter()
+                    .position(|n| {
+                        (n.lat - lat).abs() < 0.001
+                            && (n.lon - lon).abs() < 0.001
+                            && n.label == label
+                    })
+                    .map(|i| (id, i))
+            })
+        });
     }
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
@@ -1010,6 +1143,15 @@ impl App {
                     self.dark = appearance::dark_preference();
                 }
                 let mut tasks = Vec::new();
+                if let Some(id) = self.window_id {
+                    if let Some(revision) = self.window_state.capture_due(now) {
+                        tasks.push(
+                            window_state::capture(id).map(move |snapshot| {
+                                Message::WindowCaptured(id, revision, snapshot)
+                            }),
+                        );
+                    }
+                }
                 let mut events = Vec::new();
                 if let Some(m) = &mut self.manager {
                     for _ in 0..128 {
@@ -1059,9 +1201,9 @@ impl App {
                             };
                             self.geo_bytes = Some((received, total));
                         }
-                        geo::GeoEvent::Validating { .. } => self.geo_status = K::ValidatingDatabase,
-                        geo::GeoEvent::Ready { .. } => self.geo_status = K::DatabaseReady,
-                        geo::GeoEvent::Failed { .. } => self.geo_status = K::DatabaseFailed,
+                        geo::GeoEvent::Validating => self.geo_status = K::ValidatingDatabase,
+                        geo::GeoEvent::Ready => self.geo_status = K::DatabaseReady,
+                        geo::GeoEvent::Failed => self.geo_status = K::DatabaseFailed,
                         _ => {}
                     }
                 }
@@ -1073,6 +1215,7 @@ impl App {
                         .map(|a| a.smooth(now))
                         .unwrap_or(0.0);
                 }
+                tasks.push(self.follow_journey(now));
                 return Task::batch(tasks);
             }
             Message::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
@@ -1092,6 +1235,17 @@ impl App {
             Message::Input(v) => self.input = v,
             Message::Start => return self.start(),
             Message::Stop => self.stop(),
+            Message::Clear => self.clear_view(),
+            Message::FitMap => {
+                self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
+            }
+            Message::JourneyViewport(viewport) => self.journey_follow.observe(
+                Instant::now(),
+                viewport.absolute_offset().x,
+                viewport.bounds().width,
+                viewport.content_bounds().width,
+            ),
+            Message::JourneyHover(hovered) => self.journey_follow.hover(Instant::now(), hovered),
             Message::Retrace => {
                 if self.running {
                     if let (Some(m), Some(s)) = (&self.manager, self.sessions.get(self.selected)) {
@@ -1113,6 +1267,8 @@ impl App {
                 }
             }
             Message::Demo => {
+                self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
+                self.selected_map_node = None;
                 self.stop();
                 self.geo_cancel.store(true, Ordering::Release);
                 self.geo_epoch += 1;
@@ -1161,7 +1317,9 @@ impl App {
                 }
             }
             Message::ToggleMulti => {
+                self.selected_map_node = None;
                 if self.multi {
+                    self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
                     self.stop();
                     self.multi = false;
                     self.sessions = std::mem::take(&mut self.retained_single);
@@ -1197,6 +1355,7 @@ impl App {
                 }
             }
             Message::ApplyTargets => {
+                self.selected_map_node = None;
                 let mut targets = Vec::new();
                 let mut seen = HashSet::new();
                 let mut invalid = false;
@@ -1219,6 +1378,7 @@ impl App {
                         self.retained_single = self.sessions.clone()
                     }
                     self.multi = true;
+                    self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
                     self.multi_targets = targets;
                     self.sessions = if self.demonstration {
                         demo::sessions(self.multi_targets.len())
@@ -1232,13 +1392,41 @@ impl App {
                 }
             }
             Message::Select(i) => {
-                self.selected = i;
-                if self.multi || self.config.window_width < 940.0 {
+                if i < self.sessions.len() {
+                    self.selected = i;
+                }
+                self.selected_map_node = None;
+                if self.multi || self.config.window_width < 960.0 || self.focus_map {
                     self.modal = Some(Modal::Details)
                 }
             }
+            Message::MapSelected(map_view::MapEvent::Selected {
+                route_id,
+                node_index,
+            }) => {
+                if let Some(index) = self.sessions.iter().position(|s| s.target_id == route_id) {
+                    if self
+                        .routes
+                        .iter()
+                        .find(|r| r.id == route_id)
+                        .is_some_and(|r| node_index < r.nodes.len())
+                    {
+                        self.selected = index;
+                        self.selected_map_node = Some((route_id, node_index));
+                        self.show_hops = true;
+                        if self.multi || self.config.window_width < 960.0 || self.focus_map {
+                            self.modal = Some(Modal::Details);
+                        }
+                    }
+                }
+            }
+            Message::InspectorTab(hops) => self.show_hops = hops,
+            Message::FocusMap => self.focus_map = !self.focus_map,
+            Message::DetailToggle => self.expanded_details = !self.expanded_details,
+            Message::OpenExport => self.modal = Some(Modal::Export),
             Message::Settings => self.modal = Some(Modal::Settings),
             Message::About => self.modal = Some(Modal::About),
+            Message::Licenses => self.modal = Some(Modal::Licenses),
             Message::History => {
                 match self.history.list() {
                     Ok(entries) => self.history_entries = entries,
@@ -1320,6 +1508,7 @@ impl App {
                 if epoch == self.geo_epoch && !self.demonstration {
                     self.geo_busy = false;
                     self.geo_bytes = None;
+                    self.geo_error = r.as_ref().err().cloned();
                     self.geo_status = if r.is_ok() {
                         K::DatabaseReady
                     } else {
@@ -1432,6 +1621,7 @@ impl App {
             }
             Message::LoadHistory(id) => match self.history.load(&id) {
                 Ok(b) => {
+                    self.map_reset_epoch = self.map_reset_epoch.wrapping_add(1);
                     self.stop();
                     self.geo_cancel.store(true, Ordering::Release);
                     self.geo_epoch += 1;
@@ -1440,6 +1630,7 @@ impl App {
                     self.pending_geo.clear();
                     self.location_cache.clear();
                     self.retained_demo = None;
+                    self.selected_map_node = None;
                     self.demonstration = b.demonstration;
                     self.saved = true;
                     self.sessions = b.sessions;
@@ -1471,19 +1662,44 @@ impl App {
             }
             Message::Copy(v) => return iced::clipboard::write(v),
             Message::Theme(mode) => self.dark = mode != iced::theme::Mode::Light,
+            Message::WindowRestored => self.window_state.restored(),
+            Message::WindowCaptured(id, revision, snapshot) => {
+                if self.window_state.accept(revision, snapshot) {
+                    self.persist();
+                    if self.window_state.closing() {
+                        return window::close(id);
+                    }
+                }
+            }
             Message::Window((id, event)) => {
                 self.window_id = Some(id);
                 match event {
+                    window::Event::Opened { size, .. } => {
+                        let restore = window_state::restore(id, &self.config)
+                            .map(|_| Message::WindowRestored);
+                        self.config.window_width = size.width;
+                        self.config.window_height = size.height;
+                        return restore;
+                    }
                     window::Event::Resized(size) => {
                         self.config.window_width = size.width;
                         self.config.window_height = size.height;
-                        self.last_config_save = Instant::now();
+                        self.window_state.changed();
+                    }
+                    window::Event::Moved(_)
+                    | window::Event::Rescaled(_)
+                    | window::Event::Focused
+                    | window::Event::Unfocused => {
+                        self.window_state.changed();
                     }
                     window::Event::CloseRequested => {
                         self.stop();
-                        self.persist();
                         self.geo_cancel.store(true, Ordering::Release);
-                        return window::close(id);
+                        if let Some(revision) = self.window_state.close() {
+                            return window_state::capture(id).map(move |snapshot| {
+                                Message::WindowCaptured(id, revision, snapshot)
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -1493,13 +1709,20 @@ impl App {
         Task::none()
     }
     fn subscription(&self) -> Subscription<Message> {
-        let active = self.routes.iter().any(|r| r.progress < 1.0)
-            && self.animations.values().any(|a| a.paused.is_none());
+        let active = self.routes.iter().any(|r| {
+            r.nodes.len() > 1
+                && self
+                    .animations
+                    .get(&r.id)
+                    .is_some_and(|a| a.paused.is_none())
+        });
         Subscription::batch([
             iced::time::every(Duration::from_millis(if active {
                 if self.config.reduced_effects { 33 } else { 16 }
-            } else {
+            } else if self.running || self.geo_busy {
                 250
+            } else {
+                1000
             }))
             .map(Message::Tick),
             window::events().map(Message::Window),
@@ -1508,707 +1731,18 @@ impl App {
         ])
     }
     fn theme(&self) -> Theme {
-        let palette = iced::theme::Palette {
-            background: if self.dark {
-                Color::from_rgb8(9, 11, 15)
-            } else {
-                Color::from_rgb8(235, 239, 243)
+        let colors = ui::palette(self.dark);
+        Theme::custom(
+            "NeonTrace",
+            iced::theme::Palette {
+                background: colors.bg,
+                text: colors.text,
+                primary: Color::from_rgb8(43, 135, 229),
+                success: Color::from_rgb8(57, 186, 113),
+                warning: Color::from_rgb8(207, 149, 63),
+                danger: Color::from_rgb8(212, 83, 87),
             },
-            text: if self.dark {
-                Color::from_rgb8(235, 239, 245)
-            } else {
-                Color::from_rgb8(30, 41, 53)
-            },
-            primary: Color::from_rgb8(43, 135, 229),
-            success: Color::from_rgb8(57, 186, 113),
-            warning: Color::from_rgb8(207, 149, 63),
-            danger: Color::from_rgb8(212, 83, 87),
-        };
-        Theme::custom("NeonTrace", palette)
-    }
-    fn view(&self) -> Element<'_, Message> {
-        let narrow = self.config.window_width < 940.0;
-        let brand = row![
-            text("NeonTrace").size(27).color(if self.dark {
-                Color::from_rgb8(225, 237, 251)
-            } else {
-                Color::from_rgb8(29, 57, 82)
-            }),
-            Space::new().width(Fill),
-            button(self.t(K::Settings)).on_press(Message::Settings),
-            button(self.t(K::About)).on_press(Message::About)
-        ]
-        .spacing(10)
-        .align_y(iced::Center);
-        let target_field: Element<_> = if self.multi {
-            text(self.language.format(
-                K::CountTargets,
-                &[("count", &self.multi_targets.len().to_string())],
-            ))
-            .size(16)
-            .into()
-        } else {
-            text_input(self.t(K::TargetHint), &self.input)
-                .on_input(Message::Input)
-                .on_submit(Message::Start)
-                .padding(11)
-                .into()
-        };
-        let controls = row![
-            target_field,
-            button(self.t(if self.running { K::Stop } else { K::Start }))
-                .on_press(if self.running {
-                    Message::Stop
-                } else {
-                    Message::Start
-                })
-                .padding([10, 18])
-                .style(if self.running {
-                    button_style::danger
-                } else {
-                    button_style::primary
-                }),
-            button(self.t(if self.multi {
-                K::SingleTarget
-            } else {
-                K::MultiTarget
-            }))
-            .on_press(Message::ToggleMulti)
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
-        let mut playback = row![
-            button(self.t(K::Replay)).on_press(Message::Replay),
-            button(self.t(if self.presentation_paused {
-                K::Resume
-            } else {
-                K::Pause
-            }))
-            .on_press(Message::Pause)
-        ]
-        .spacing(7);
-        if narrow && !self.multi {
-            playback = playback
-                .push(Space::new().width(Fill))
-                .push(button(self.t(K::Details)).on_press(Message::Select(self.selected)));
-        }
-        let actions = row![
-            button(self.t(if self.demonstration {
-                K::ExitDemo
-            } else {
-                K::Demo
-            }))
-            .on_press(Message::Demo)
-            .style(button_style::secondary),
-            Space::new().width(Fill),
-            button(self.t(K::History)).on_press(Message::History),
-            button(self.t(K::Export)).on_press(Message::Settings)
-        ]
-        .spacing(7)
-        .align_y(iced::Center);
-        let secondary: Element<_> = if narrow {
-            column![playback, actions].spacing(6).into()
-        } else {
-            row![playback, actions.width(Fill)].spacing(12).into()
-        };
-        let mut mapcol = column![
-            row![
-                text(self.t(if self.demonstration {
-                    K::DemoWarning
-                } else if self.saved {
-                    K::SavedResult
-                } else {
-                    K::ObservedRoute
-                }))
-                .size(12),
-                Space::new().width(Fill),
-                text(self.language.format(K::SecondsValue, &[("value", "8")])).size(12)
-            ]
-            .spacing(8),
-            canvas(MapView {
-                cache: &self.cache,
-                routes: &self.routes,
-                selected_id: self.sessions.get(self.selected).map(|s| s.target_id),
-                dark: self.dark
-            })
-            .width(Fill)
-            .height(Fill),
-            text(self.t(K::Schematic)).size(11),
-            text("Simplemaps · IP Geolocation by DB-IP · CC BY 4.0 · db-ip.com").size(9)
-        ]
-        .spacing(6)
-        .height(Fill);
-        if self.geo_busy && !self.demonstration {
-            let transferred = self
-                .geo_bytes
-                .map(|(bytes, total)| {
-                    format!(
-                        "{:.1} MB / {}",
-                        bytes as f64 / 1e6,
-                        total
-                            .map(|n| format!("{:.1} MB", n as f64 / 1e6))
-                            .unwrap_or_else(|| "—".into())
-                    )
-                })
-                .unwrap_or_default();
-            mapcol = mapcol.push(
-                row![
-                    text(self.t(self.geo_status)).size(11).width(Fill),
-                    text(transferred).size(11)
-                ]
-                .spacing(8),
-            );
-            if let Some((received, Some(total))) = self.geo_bytes {
-                if total > 0 {
-                    mapcol = mapcol.push(
-                        progress_bar(
-                            0.0..=1.0,
-                            (received as f64 / total as f64).clamp(0.0, 1.0) as f32,
-                        )
-                        .girth(3),
-                    );
-                }
-            }
-        }
-        if self.multi {
-            let mut targets =
-                column![button(self.t(K::ConfigureTargets)).on_press(Message::OpenTargets)]
-                    .spacing(5);
-            for (i, s) in self.sessions.iter().enumerate() {
-                let stats = s.statistics();
-                targets = targets.push(
-                    button(
-                        row![
-                            text(format!("{}  {}", i + 1, s.target)).width(Fill),
-                            text(ms(s.pings.last().and_then(|p| p.rtt_ms))).size(13),
-                            text(self.t(self.session_status(s))).size(11),
-                            text(format!("{}/{}", stats.replies, stats.sent)).size(12)
-                        ]
-                        .spacing(8),
-                    )
-                    .on_press(Message::Select(i))
-                    .width(Fill),
-                );
-            }
-            mapcol = mapcol.push(scrollable(targets).height(Length::Fixed(if narrow {
-                115.0
-            } else {
-                140.0
-            })));
-        }
-        let map_panel = container(mapcol)
-            .padding(14)
-            .width(Fill)
-            .height(Fill)
-            .style(move |_: &Theme| container::Style {
-                background: Some(iced::Background::Color(if self.dark {
-                    Color::from_rgb8(7, 14, 24)
-                } else {
-                    Color::from_rgb8(207, 221, 232)
-                })),
-                border: iced::Border {
-                    color: if self.dark {
-                        Color::from_rgb8(28, 48, 68)
-                    } else {
-                        Color::from_rgb8(162, 183, 202)
-                    },
-                    width: 1.0,
-                    radius: 10.0.into(),
-                },
-                ..Default::default()
-            });
-        let center: Element<_> = if !self.multi && !narrow {
-            row![
-                map_panel,
-                container(scrollable(container(self.inspector()).padding(
-                    iced::Padding {
-                        right: 14.0,
-                        ..Default::default()
-                    }
-                )))
-                .padding(12)
-                .width(Length::Fixed(268.0))
-                .height(Fill)
-                .style(container::rounded_box)
-            ]
-            .spacing(12)
-            .height(Fill)
-            .into()
-        } else {
-            map_panel.into()
-        };
-        let mut body = column![brand, controls, secondary, center]
-            .spacing(if narrow { 8 } else { 12 })
-            .padding(if narrow { 10 } else { 18 })
-            .height(Fill);
-        if !self.multi {
-            body = body.push(self.hop_strip(narrow));
-        }
-        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        body = body.push(
-            row![
-                text(self.t(self.status)).size(11).width(Fill),
-                text(ts).size(11)
-            ]
-            .spacing(10),
-        );
-        let base: Element<_> = body.into();
-        if let Some(modal) = self.modal {
-            stack![
-                base,
-                opaque(
-                    container(
-                        container(self.modal_view(modal))
-                            .padding(22)
-                            .width(Length::FillPortion(1))
-                            .max_width(650)
-                            .max_height((self.config.window_height - 36.0).max(300.0))
-                            .style(container::bordered_box)
-                    )
-                    .center_x(Fill)
-                    .center_y(Fill)
-                    .width(Fill)
-                    .height(Fill)
-                    .style(|_| container::Style {
-                        background: Some(Color::from_rgba8(0, 0, 0, 0.7).into()),
-                        ..Default::default()
-                    })
-                )
-            ]
-            .into()
-        } else {
-            base
-        }
-    }
-    fn inspector(&self) -> Element<'_, Message> {
-        let Some(s) = self.sessions.get(self.selected) else {
-            return column![
-                text(self.t(K::Endpoint)).size(21),
-                text(self.t(K::Idle)),
-                horizontal_rule(1),
-                text(self.t(K::DownloadOnFirstUse)).size(13),
-                text(self.t(K::PrivacyNote)).size(12)
-            ]
-            .spacing(15)
-            .into();
-        };
-        let stats = s.statistics();
-        let mut content = column![
-            text(self.t(K::Endpoint)).size(19),
-            text(&s.target)
-                .size(18)
-                .wrapping(iced::widget::text::Wrapping::Glyph),
-            text(self.t(self.session_status(s))).size(12),
-            text(self.t(K::SelectedAddress)).size(11),
-            button(
-                text(s.chosen_ip.as_deref().unwrap_or(self.t(K::Unknown)))
-                    .size(13)
-                    .wrapping(iced::widget::text::Wrapping::Glyph)
-            )
-            .width(Fill)
-            .on_press(Message::Copy(s.chosen_ip.clone().unwrap_or_default()))
-            .style(button_style::text),
-            text(s.address_family.as_deref().unwrap_or("—")).size(12),
-            horizontal_rule(1),
-            text(self.t(K::CurrentRtt)).size(12),
-            text(ms(s.pings.last().and_then(|p| p.rtt_ms))).size(35)
-        ]
-        .spacing(9);
-        for (k, v) in [
-            (K::Minimum, ms(stats.minimum_ms)),
-            (K::Average, ms(stats.average_ms)),
-            (K::Maximum, ms(stats.maximum_ms)),
-            (K::Replies, stats.replies.to_string()),
-            (K::Nonresponses, stats.nonresponses.to_string()),
-            (K::Samples, stats.sent.to_string()),
-            (
-                K::Elapsed,
-                self.seconds(
-                    s.ended_unix_ms
-                        .unwrap_or_else(export::now_ms)
-                        .saturating_sub(s.started_unix_ms)
-                        / 1000,
-                ),
-            ),
-            (
-                K::RouteAge,
-                s.route_timestamp_unix_ms
-                    .map(|t| self.seconds(export::now_ms().saturating_sub(t) / 1000))
-                    .unwrap_or_else(|| "—".into()),
-            ),
-        ] {
-            content = content
-                .push(row![text(self.t(k)).size(12).width(Fill), text(v).size(12)].spacing(8));
-        }
-        content = content
-            .push(text(self.t(K::SampleWindow)).size(10))
-            .push(horizontal_rule(1))
-            .push(
-                text(self.t(if s.destination_reached {
-                    K::Complete
-                } else {
-                    K::PartialRoute
-                }))
-                .size(12),
-            )
-            .push(
-                button(self.t(K::TraceAgain))
-                    .on_press(Message::Retrace)
-                    .width(Fill),
-            );
-        if let Some(t) = s.tcp_checks.last() {
-            content = content.push(
-                text(format!(
-                    "TCP 443 · {} · {}",
-                    self.t(if t.status == SampleStatus::Reply {
-                        K::Complete
-                    } else {
-                        K::Unavailable
-                    }),
-                    ms(t.connection_ms)
-                ))
-                .size(12),
-            );
-        }
-        content = content.push(text(self.t(K::Origin)).size(13));
-        if let Some(p) = &s.origin {
-            content = content
-                .push(text(location(p, self.t(K::LocationUnknown))).size(12))
-                .push(text(p.ip.clone().unwrap_or_default()).size(12));
-        } else {
-            content = content
-                .push(
-                    text(format!(
-                        "○ {} · {}",
-                        self.t(K::YourPc),
-                        self.t(K::LocationUnknown)
-                    ))
-                    .size(12),
-                )
-                .push(text(self.t(K::OriginUnavailable)).size(12));
-        }
-        content = content.push(text(self.t(K::EstimatedOrigin)).size(11));
-        if let Some(p) = &s.endpoint {
-            content = content
-                .push(text(self.t(K::Endpoint)).size(13))
-                .push(text(location(p, self.t(K::LocationUnknown))).size(12));
-            if let Some(asn) = p.asn {
-                content = content.push(
-                    text(format!(
-                        "AS{asn} · {}",
-                        p.organization.as_deref().unwrap_or(self.t(K::Unknown))
-                    ))
-                    .size(11),
-                );
-            }
-            if let Some(provider) = &p.provider {
-                content =
-                    content.push(text(format!("{}: {provider}", self.t(K::DataSource))).size(10));
-            }
-            if p.city_edition.is_some() || p.asn_edition.is_some() {
-                content = content.push(
-                    text(format!(
-                        "{}: {} / {}",
-                        self.t(K::DataEdition),
-                        p.city_edition.as_deref().unwrap_or("—"),
-                        p.asn_edition.as_deref().unwrap_or("—")
-                    ))
-                    .size(10),
-                );
-            }
-        }
-
-        for h in &s.hops {
-            let address = h
-                .responses
-                .first()
-                .map(|r| r.address.clone())
-                .unwrap_or_else(|| self.t(K::NoReply).into());
-            content = content.push(
-                text(format!("{} {} · {}", self.t(K::Hop), h.ttl, address))
-                    .size(12)
-                    .wrapping(iced::widget::text::Wrapping::Glyph),
-            );
-            for r in &h.responses {
-                content = content.push(
-                    button(
-                        text(format!(
-                            "{} · {}",
-                            r.location
-                                .as_ref()
-                                .map(|p| location(p, self.t(K::LocationUnknown)))
-                                .unwrap_or_else(|| self.t(K::LocationUnknown).into()),
-                            ms(r.rtt_ms)
-                        ))
-                        .size(11),
-                    )
-                    .on_press(Message::Copy(r.address.clone()))
-                    .style(button_style::text),
-                );
-                if let Some(p) = &r.location {
-                    if let Some(asn) = p.asn {
-                        content = content.push(
-                            text(format!(
-                                "AS{asn} · {}",
-                                p.organization.as_deref().unwrap_or(self.t(K::Unknown))
-                            ))
-                            .size(10),
-                        );
-                    }
-                }
-            }
-        }
-        if !s.errors.is_empty() {
-            content = content.push(text(self.t(K::TechnicalDetails)).size(12));
-            for e in s.errors.iter().rev().take(3) {
-                content = content.push(text(format!("{}: {}", e.code, e.detail)).size(11));
-            }
-        }
-        content.into()
-    }
-    fn hop_strip(&self, _narrow: bool) -> Element<'_, Message> {
-        let Some(route) = self.routes.get(self.selected) else {
-            return text(self.t(K::NotDeliveryProgress)).size(11).into();
-        };
-        if route.nodes.len() < 2 {
-            return text(self.t(K::LocationUnknown)).size(12).into();
-        }
-        let count = route.nodes.len() - 1;
-        let mut bars = row![].spacing(8);
-        for i in 0..count {
-            let fill = (route.progress * count as f32 - i as f32).clamp(0.0, 1.0);
-            bars = bars.push(
-                column![
-                    text(format!("{:02}  {}", i + 1, route.nodes[i + 1].label)).size(11),
-                    progress_bar(0.0..=1.0, fill)
-                        .girth(4)
-                        .style(iced::widget::progress_bar::success),
-                    text(format!("{:.0}%", fill * 100.0)).size(10)
-                ]
-                .spacing(5)
-                .width(if count > 6 {
-                    Length::Fixed(155.0)
-                } else {
-                    Length::Fill
-                }),
-            );
-        }
-        let content: Element<_> = if count > 6 {
-            scrollable(bars)
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    iced::widget::scrollable::Scrollbar::default(),
-                ))
-                .height(50)
-                .into()
-        } else {
-            container(bars.width(Fill)).height(50).width(Fill).into()
-        };
-        column![
-            text(self.t(K::AnimationProgress)).size(11),
-            content,
-            text(self.t(K::NotDeliveryProgress)).size(10)
-        ]
-        .spacing(5)
-        .into()
-    }
-    fn modal_view(&self, modal: Modal) -> Element<'_, Message> {
-        let title = match modal {
-            Modal::Targets => K::ConfigureTargets,
-            Modal::Settings => K::Settings,
-            Modal::About => K::About,
-            Modal::History => K::History,
-            Modal::Details => K::Details,
-        };
-        let mut c = column![
-            row![
-                text(self.t(title)).size(24).width(Fill),
-                button(self.t(K::Close)).on_press(Message::CloseModal)
-            ]
-            .spacing(10),
-            horizontal_rule(1)
-        ]
-        .spacing(14);
-        match modal {
-            Modal::Targets => {
-                c = c.push(text(self.t(K::TargetListHint)).size(13));
-                let mut entries = column![].spacing(10);
-                for (i, value) in self.fields.iter().enumerate() {
-                    let mut entry = column![
-                        row![
-                            text((i + 1).to_string()).size(15),
-                            text_input(self.t(K::TargetHint), value)
-                                .on_input(move |v| Message::TargetInput(i, v))
-                                .padding(9),
-                            button(self.t(K::Remove)).on_press(Message::RemoveTarget(i))
-                        ]
-                        .spacing(7)
-                        .align_y(iced::Center)
-                    ]
-                    .spacing(4);
-                    if let Some(k) = self.field_errors.get(i).and_then(|v| *v) {
-                        entry = entry.push(
-                            text(self.t(k))
-                                .size(11)
-                                .color(Color::from_rgb8(210, 87, 86)),
-                        )
-                    }
-                    entries = entries.push(entry);
-                }
-                c = c.push(scrollable(entries).height(Length::Fixed(
-                    (self.fields.len() as f32 * 74.0).min(self.config.window_height - 270.0),
-                )));
-                c = c.push(
-                    row![
-                        button(self.t(K::AddTarget))
-                            .on_press_maybe((self.fields.len() < 10).then_some(Message::AddTarget)),
-                        Space::new().width(Fill),
-                        button(self.t(K::Cancel)).on_press(Message::CloseModal),
-                        button(self.t(K::Apply))
-                            .on_press(Message::ApplyTargets)
-                            .style(button_style::primary)
-                    ]
-                    .spacing(8),
-                );
-            }
-            Modal::Settings => {
-                c = c
-                    .push(
-                        row![
-                            text(self.t(K::Language)).width(Fill),
-                            pick_list(Language::ALL, Some(self.language), Message::Language)
-                        ]
-                        .spacing(10),
-                    )
-                    .push(text(self.t(K::SystemTheme)).size(12))
-                    .push(
-                        checkbox(self.config.tcp_check)
-                            .label(self.t(K::TcpCheck))
-                            .on_toggle(Message::Tcp),
-                    )
-                    .push(text(self.t(K::TcpNote)).size(11))
-                    .push(
-                        checkbox(self.config.history_enabled)
-                            .label(self.t(K::EnableHistory))
-                            .on_toggle(Message::HistoryEnabled),
-                    )
-                    .push(
-                        text(self.t(if self.config.history_enabled {
-                            K::HistoryRetention
-                        } else {
-                            K::HistoryDisabled
-                        }))
-                        .size(11),
-                    )
-                    .push(
-                        checkbox(self.config.reduced_effects)
-                            .label(self.t(K::ReducedEffects))
-                            .on_toggle(Message::Effects),
-                    )
-                    .push(horizontal_rule(1))
-                    .push(text(self.t(K::LocationData)).size(17))
-                    .push(text(self.t(self.geo_status)).size(12));
-                if let Some((bytes, total)) = self.geo_bytes {
-                    c = c.push(
-                        text(format!(
-                            "{:.1} MB / {}",
-                            bytes as f64 / 1e6,
-                            total
-                                .map(|v| format!("{:.1} MB", v as f64 / 1e6))
-                                .unwrap_or_else(|| "—".into())
-                        ))
-                        .size(12),
-                    );
-                }
-                if let Some(g) = &self.geo {
-                    for e in g.editions() {
-                        c = c.push(
-                            text(format!(
-                                "DB-IP {} · {} · {}",
-                                self.t(if e.kind == geo::DatasetKind::City {
-                                    K::CityDatabase
-                                } else {
-                                    K::AsnDatabase
-                                }),
-                                e.edition,
-                                chrono::DateTime::from_timestamp(e.installed_unix as i64, 0)
-                                    .map(|t| t.format("%Y-%m-%d").to_string())
-                                    .unwrap_or_default()
-                            ))
-                            .size(11),
-                        );
-                    }
-                }
-                c = c
-                    .push(button(self.t(K::Refresh)).on_press_maybe(
-                        (!self.geo_busy && !self.demonstration).then_some(Message::Refresh),
-                    ))
-                    .push(horizontal_rule(1))
-                    .push(
-                        row![
-                            button(self.t(K::ExportPng)).on_press(Message::Export("png")),
-                            button(self.t(K::ExportJson)).on_press(Message::Export("json")),
-                            button(self.t(K::ExportCsv)).on_press(Message::Export("csv"))
-                        ]
-                        .spacing(8),
-                    )
-                    .push(text(self.t(K::PrivacyNote)).size(11));
-            }
-            Modal::About => {
-                c = c
-                    .push(text("NeonTrace 1.0.0").size(22))
-                    .push(text("Copyright (c) 2026 Davoda1 · MIT"))
-                    .push(text(self.t(K::Credits)).size(17))
-                    .push(text(self.t(K::MapCredit)).size(13))
-                    .push(text("https://simplemaps.com/resources/svg-world").size(12))
-                    .push(text(self.t(K::GeoCredit)).size(13))
-                    .push(
-                        text("https://db-ip.com/ · https://creativecommons.org/licenses/by/4.0/")
-                            .size(12),
-                    )
-                    .push(text(self.t(K::PrivacyNote)).size(12))
-                    .push(text(include_str!("../assets/SIMPLEMAPS-LICENSE.txt")).size(11));
-            }
-            Modal::History => {
-                c = c.push(button(self.t(K::ClearHistory)).on_press(Message::ClearHistory));
-                if self.history_entries.is_empty() {
-                    c = c.push(text(self.t(K::EmptyHistory)))
-                }
-                for h in &self.history_entries {
-                    c = c.push(
-                        column![
-                            text(h.targets.join(", ")).size(13),
-                            text(format!(
-                                "{} · {}",
-                                chrono::DateTime::from_timestamp_millis(h.saved_unix_ms as i64)
-                                    .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                                    .unwrap_or_default(),
-                                self.t(if h.demonstration {
-                                    K::DemoLabel
-                                } else {
-                                    K::SavedResult
-                                })
-                            ))
-                            .size(11),
-                            row![
-                                button(self.t(K::Replay))
-                                    .on_press(Message::LoadHistory(h.id.clone())),
-                                button(self.t(K::DeleteRecord))
-                                    .on_press(Message::DeleteHistory(h.id.clone()))
-                            ]
-                            .spacing(8)
-                        ]
-                        .spacing(6),
-                    );
-                }
-            }
-            Modal::Details => c = c.push(self.inspector()),
-        }
-        scrollable(container(c).padding(iced::Padding {
-            right: 14.0,
-            ..Default::default()
-        }))
-        .height(Length::Shrink)
-        .into()
+        )
     }
 }
 impl Drop for App {
@@ -2220,27 +1754,11 @@ impl Drop for App {
     }
 }
 fn button<'a>(content: impl Into<Element<'a, Message>>) -> iced::widget::Button<'a, Message> {
-    iced::widget::button(content).style(|theme: &Theme, status| {
-        let palette = theme.extended_palette();
-        let mut style = button_style::secondary(theme, status);
-        style.background = Some(
-            match status {
-                button_style::Status::Hovered | button_style::Status::Pressed => {
-                    palette.background.strong.color
-                }
-                _ => palette.background.weak.color,
-            }
-            .into(),
-        );
-        style.text_color = palette.background.base.text;
-        style.border = iced::Border {
-            color: palette.background.strong.color,
-            width: 1.0,
-            radius: 6.0.into(),
-        };
-        style
-    })
+    iced::widget::button(content)
+        .padding([8, 12])
+        .style(|theme: &Theme, status| ui::quiet(theme.palette().background.r < 0.5, status))
 }
+
 fn location_point(ip: IpAddr, p: geo::GeoLocation) -> GeoPoint {
     GeoPoint {
         ip: Some(ip.to_string()),
@@ -2398,9 +1916,11 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .theme(App::theme)
         .font(include_bytes!("../assets/DejaVuSans.ttf").as_slice())
+        .font(include_bytes!("../assets/DejaVuSans-Bold.ttf").as_slice())
         .default_font(iced::Font::with_name("DejaVu Sans"))
         .window(window::Settings {
             size: Size::new(config.window_width, config.window_height),
+            position: window_state::initial_position(&config),
             min_size: Some(Size::new(680.0, 540.0)),
             icon: window::icon::from_rgba(
                 include_bytes!("../assets/neontrace-64.rgba").to_vec(),
@@ -2418,14 +1938,129 @@ fn main() -> iced::Result {
 mod tests {
     use super::*;
     #[test]
-    fn fixed_timeline_and_continuous_segment_bars() {
+    fn multiple_targets_open_with_one_empty_entry() {
+        let (mut app, _) = App::new();
+        app.history.set_enabled(false);
+        assert_eq!(app.multi_targets, vec![String::new()]);
+        let map_epoch = app.map_reset_epoch;
+        let _ = app.update(Message::ToggleMulti);
+        assert_eq!(app.map_reset_epoch, map_epoch);
+        assert!(app.modal == Some(Modal::Targets));
+        assert_eq!(app.fields, vec![String::new()]);
+        let _ = app.update(Message::ApplyTargets);
+        assert!(!app.multi && !app.running && app.sessions.is_empty());
+        assert!(app.field_errors[0].is_some());
+        let _ = app.update(Message::CloseModal);
+        assert_eq!(app.map_reset_epoch, map_epoch);
+    }
+    #[test]
+    fn clear_resets_the_view_and_rejects_late_work_without_deleting_history() {
+        let (mut app, _) = App::new();
+        let history_path = std::env::temp_dir().join(format!(
+            "neontrace-clear-test-{}-{}",
+            std::process::id(),
+            export::now_ms()
+        ));
+        app.history = storage::HistoryStore::new(history_path.clone(), true);
+        let _ = app.update(Message::Demo);
+        app.history.record(&app.bundle()).unwrap();
+        let prefs = serde_json::to_value(&app.config).unwrap();
+        let old_epoch = app.geo_epoch;
+        let old_cancel = app.geo_cancel.clone();
+        let old_sender = app.geo_tx.clone();
+        app.input = "demo1.example.net".into();
+        app.focus_map = true;
+        app.show_hops = true;
+        app.expanded_details = true;
+        app.selected_map_node = Some((1, 0));
+        app.presentation_paused = true;
+        app.multi = true;
+        let _ = app.update(Message::Clear);
+        assert!(!app.running && !app.demonstration && !app.multi && !app.saved);
+        assert!(app.sessions.is_empty() && app.routes.is_empty() && app.animations.is_empty());
+        assert!(
+            app.input.is_empty() && app.retained_single.is_empty() && app.retained_demo.is_none()
+        );
+        assert_eq!(app.multi_targets, vec![String::new()]);
+        assert!(app.selected_map_node.is_none() && app.modal.is_none());
+        assert!(
+            !app.focus_map && !app.show_hops && !app.expanded_details && !app.presentation_paused
+        );
+        assert!(app.status == K::Idle && app.geo_error.is_none());
+        assert!(old_cancel.load(Ordering::Acquire));
+        assert!(old_sender.try_send(geo::GeoEvent::Failed).is_err());
+        let _ = app.update(Message::GeoDone(old_epoch, Err("stale failure".into())));
+        assert!(app.geo_error.is_none());
+        assert_eq!(serde_json::to_value(&app.config).unwrap(), prefs);
+        assert_eq!(app.history.list().unwrap().len(), 1);
+        std::fs::remove_dir_all(history_path).unwrap();
+    }
+    #[test]
+    fn clear_is_ignored_while_measuring_and_fit_keeps_playback() {
+        let (mut app, _) = App::new();
+        app.history.set_enabled(false);
+        app.sessions = demo::sessions(1);
+        app.replay();
+        app.running = true;
+        let epoch = app.map_reset_epoch;
+        let started = app.animations[&1].start;
+        let _ = app.update(Message::Clear);
+        assert!(app.running && !app.sessions.is_empty());
+        assert_eq!(app.map_reset_epoch, epoch);
+        let _ = app.update(Message::FitMap);
+        assert_ne!(app.map_reset_epoch, epoch);
+        assert_eq!(app.animations[&1].start, started);
+        app.running = false;
+    }
+    #[test]
+    fn multiple_target_selection_opens_optional_details_on_wide_windows() {
+        let (mut app, _) = App::new();
+        app.history.set_enabled(false);
+        app.multi = true;
+        app.sessions = demo::sessions(4);
+        app.config.window_width = 1440.;
+        let _ = app.update(Message::Select(2));
+        assert_eq!(app.selected, 2);
+        assert!(app.modal == Some(Modal::Details));
+    }
+    #[test]
+    fn journey_repeats_after_eight_seconds_without_clock_drift() {
         let a = Animation::new();
         let at = a.start + Duration::from_millis(2500);
         let p = a.smooth(at);
         assert!((p - 0.3125).abs() < 0.00001);
-        assert!(((p * 3.0 - 0.0).clamp(0.0, 1.0) - 0.9375).abs() < 0.0001);
-        assert_eq!(a.smooth(a.start + JOURNEY), 1.0);
-        assert_eq!(a.smooth(a.start + Duration::from_secs(90)), 1.0);
+        assert_eq!(a.smooth(a.start + JOURNEY), 0.0);
+        assert_eq!(a.smooth(a.start + Duration::from_secs(90)), 0.25);
+        assert!((a.smooth(at + Duration::from_secs(86400 * 365)) - p).abs() < 0.00001);
+    }
+    #[test]
+    fn pause_and_resume_preserve_phase_across_multiple_loops() {
+        let mut a = Animation::new();
+        let paused_at = a.start + Duration::from_secs(10);
+        a.toggle_at(paused_at);
+        assert_eq!(a.smooth(a.start + Duration::from_secs(100)), 0.25);
+        a.toggle_at(a.start + Duration::from_secs(42));
+        assert_eq!(a.smooth(a.start + Duration::from_secs(44)), 0.5);
+        a.toggle_at(a.start + Duration::from_secs(46));
+        assert_eq!(a.smooth(a.start + Duration::from_secs(90)), 0.75);
+    }
+    #[test]
+    fn looping_playback_does_not_create_measurements_or_change_route_observations() {
+        let (mut app, _) = App::new();
+        app.history.set_enabled(false);
+        let _ = app.update(Message::Demo);
+        assert!(app.demonstration && !app.running);
+        assert_eq!(app.manager.as_ref().map_or(0, |m| m.active_count()), 0);
+        let before = serde_json::to_value(&app.sessions).unwrap();
+        let id = app.sessions[0].target_id;
+        let started = app.animations[&id].start;
+        let _ = app.update(Message::Tick(started + Duration::from_secs(18)));
+        assert_eq!(app.routes[0].progress, 0.25);
+        let _ = app.update(Message::Tick(started + Duration::from_secs(20)));
+        assert_eq!(app.routes[0].progress, 0.5);
+        assert_eq!(serde_json::to_value(&app.sessions).unwrap(), before);
+        assert!(!app.running);
+        assert_eq!(app.manager.as_ref().map_or(0, |m| m.active_count()), 0);
     }
     #[test]
     fn stale_session_and_route_results_cannot_mutate_current_measurements() {
@@ -2637,5 +2272,55 @@ mod tests {
         assert!(!app.running);
         assert!(app.status == K::StorageError);
         std::fs::remove_file(blocked).unwrap();
+    }
+    #[test]
+    fn selection_follows_location_when_route_nodes_change() {
+        let (mut app, _) = App::new();
+        app.sessions = demo::sessions(1);
+        app.rebuild_routes();
+        app.selected_map_node = Some((1, 2));
+        let selected = app.routes[0].nodes[2].label.clone();
+        // Insert a located response before the selected New York stage.
+        app.sessions[0].hops[3].responses[0].location = Some(GeoPoint {
+            latitude: Some(51.5),
+            longitude: Some(-0.12),
+            city: Some("London".into()),
+            ..Default::default()
+        });
+        app.rebuild_routes();
+        let (_, index) = app
+            .selected_map_node
+            .expect("selection preserved by location");
+        assert_eq!(app.routes[0].nodes[index].label, selected);
+        assert_eq!(index, 3);
+        // Removed locations must not leave an index pointing elsewhere.
+        app.sessions[0].hops[4].responses[0].location = None;
+        app.rebuild_routes();
+        assert!(app.selected_map_node.is_none());
+    }
+
+    #[test]
+    fn map_selection_links_inspector_and_rejects_stale_events() {
+        let (mut app, _) = App::new();
+        app.sessions = demo::sessions(2);
+        app.rebuild_routes();
+        let _ = app.update(Message::MapSelected(map_view::MapEvent::Selected {
+            route_id: 2,
+            node_index: 1,
+        }));
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_map_node, Some((2, 1)));
+        assert!(app.show_hops);
+        let _ = app.update(Message::MapSelected(map_view::MapEvent::Selected {
+            route_id: 99,
+            node_index: 1,
+        }));
+        let _ = app.update(Message::MapSelected(map_view::MapEvent::Selected {
+            route_id: 2,
+            node_index: 99,
+        }));
+        assert_eq!(app.selected_map_node, Some((2, 1)));
+        let _ = app.update(Message::OpenExport);
+        assert!(app.modal == Some(Modal::Export));
     }
 }

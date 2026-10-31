@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify NeonTrace's eight-file private release set.
+"""Build and verify NeonTrace's eight-file release set.
 
 This is developer tooling. It is never included in a binary package, and never
 creates a launcher or publishes a release. Run after both native builds and
@@ -19,8 +19,9 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_DIRS = {"src", "assets", "tools", "docs", ".cargo", ".github"}
-SOURCE_FILES = {"Cargo.toml", "Cargo.lock", "build.rs", "LICENSE", "README.md", ".gitignore", "rust-toolchain.toml"}
+SOURCE_DIRS = {"src", "assets", "tools", "docs", "build_support", "tests", ".cargo", ".github"}
+SOURCE_FILES = {"Cargo.toml", "Cargo.lock", "build.rs", "LICENSE", "README.md", "CHANGELOG.md", ".gitignore", "rust-toolchain.toml"}
+REQUIRED_SOURCE_FILES = {"Cargo.toml", "Cargo.lock", "build.rs", "build_support/windows_resources.rs", "tests/windows_resources.rs", "LICENSE", "src/main.rs"}
 FORBIDDEN = re.compile(rb"(?:github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{20,})")
 
 
@@ -44,7 +45,7 @@ def require_binary(path, magic):
                 raise ValueError(f"Expected Windows x64 executable: {path.name}")
 
 
-def scan_private(path):
+def scan_distribution(path):
     if "CONFIDENTIAL" in path.name.upper():
         raise ValueError(f"Confidential filename excluded: {path.name}")
     with path.open("rb") as stream:
@@ -56,10 +57,10 @@ def scan_private(path):
             overlap = data[-200:]
 
 
-def source_files():
+def source_files(root=ROOT):
     result = []
-    for path in sorted(ROOT.rglob("*")):
-        rel = path.relative_to(ROOT)
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
         if not path.is_file() or path.is_symlink():
             continue
         if len(rel.parts) == 1 and rel.name not in SOURCE_FILES:
@@ -70,10 +71,10 @@ def source_files():
             continue
         if path.suffix in {".pyc", ".tmp", ".log"}:
             continue
-        scan_private(path)
+        scan_distribution(path)
         result.append(path)
-    for required in ["Cargo.toml", "Cargo.lock", "LICENSE", "src/main.rs"]:
-        if ROOT / required not in result:
+    for required in sorted(REQUIRED_SOURCE_FILES):
+        if root / required not in result:
             raise ValueError(f"Incomplete source tree: {required}")
     return result
 
@@ -106,6 +107,38 @@ def verify_binary_archives(windows_zip, linux_tar):
         assert binary.isfile() and not binary.issym() and binary.mode & 0o111
         assert archive.extractfile(binary).read(4) == b"\x7fELF"
         assert all(not x.name.lower().endswith((".sh", ".cmd", ".ps1")) for x in archive.getmembers())
+
+
+def verify_source_archives(source_zip, source_tar, entries):
+    expected = {name: path.read_bytes() for path, name in entries}
+    with zipfile.ZipFile(source_zip) as archive:
+        if archive.testzip() is not None or set(archive.namelist()) != set(expected):
+            raise ValueError("Source ZIP contents differ from the source inventory")
+        for name, data in expected.items():
+            if archive.read(name) != data:
+                raise ValueError(f"Source ZIP content mismatch: {name}")
+    with tarfile.open(source_tar) as archive:
+        members = archive.getmembers()
+        if {m.name for m in members} != set(expected) or not all(m.isfile() for m in members):
+            raise ValueError("Source tar.gz contents differ from the source inventory")
+        for member in members:
+            if archive.extractfile(member).read() != expected[member.name]:
+                raise ValueError(f"Source tar.gz content mismatch: {member.name}")
+
+
+def verify_source_build():
+    """Compile the packaged source inventory with the existing locked cache."""
+    with tempfile.TemporaryDirectory(prefix="neontrace-source-check-") as temporary:
+        extracted = Path(temporary)
+        for path in source_files():
+            destination = extracted / path.relative_to(ROOT)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+        subprocess.run([
+            "cargo", "check", "--release", "--locked", "--offline", "--tests",
+            "--manifest-path", str(extracted / "Cargo.toml"),
+            "--target-dir", os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        ], check=True)
 
 
 def linux_glibc_floor(binary):
@@ -153,15 +186,21 @@ def build_deb(destination, binary, version, notices, notes):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--linux", type=Path, required=True)
-    parser.add_argument("--windows", type=Path, required=True)
+    parser.add_argument("--linux", type=Path)
+    parser.add_argument("--windows", type=Path)
+    parser.add_argument("--verify-source-build", action="store_true")
     parser.add_argument("--windows-dll-dir", type=Path)
     parser.add_argument("--preview", type=Path, default=ROOT / "docs/NeonTrace-Preview.html")
     parser.add_argument("--notes", type=Path, default=ROOT / "docs/README-Notes.txt")
     parser.add_argument("--notices", type=Path, default=ROOT / "docs/THIRD-PARTY-NOTICES.txt")
     parser.add_argument("--output", type=Path, default=ROOT.parent / "release")
-    parser.add_argument("--version", default="1.0.0")
+    parser.add_argument("--version", default="1.1.0")
     args = parser.parse_args()
+    if args.verify_source_build:
+        verify_source_build()
+        return
+    if args.linux is None or args.windows is None:
+        parser.error("--linux and --windows are required for release packaging")
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-\d+)?", args.version):
         parser.error("Version must be a concrete release version")
     require_binary(args.linux, b"\x7fELF")
@@ -169,14 +208,14 @@ def main():
     for path in [args.linux, args.windows, args.preview, args.notes, args.notices, ROOT / "LICENSE"]:
         if not path.is_file():
             raise ValueError(f"Required release input missing: {path.name}")
-        scan_private(path)
+        scan_distribution(path)
     args.output.mkdir(parents=True, exist_ok=True)
     prefix = f"NeonTrace-{args.version}"
     common = [(ROOT / "LICENSE", "LICENSE"), (args.notes, "README-Notes.txt"), (args.notices, "THIRD-PARTY-NOTICES.txt")]
     windows_entries = [(args.windows, "NeonTrace.exe"), *common]
     if args.windows_dll_dir:
         for path in sorted(args.windows_dll_dir.glob("*.dll")):
-            scan_private(path)
+            scan_distribution(path)
             require_binary(path, b"MZ")
             windows_entries.append((path, path.name))
     win = args.output / f"{prefix}-Windows-x64.zip"
@@ -190,6 +229,7 @@ def main():
     src_tar = args.output / f"{prefix}-Source.tar.gz"
     create_zip(src_zip, sources)
     create_tar(src_tar, sources)
+    verify_source_archives(src_zip, src_tar, sources)
     preview = args.output / f"{prefix}-Preview.html"
     notes = args.output / f"{prefix}-README-Notes.txt"
     shutil.copy2(args.preview, preview)
@@ -197,7 +237,11 @@ def main():
     verify_binary_archives(win, linux)
     outputs = [win, linux, deb, src_zip, src_tar, preview, notes]
     sums = args.output / "SHA256SUM.txt"
-    sums.write_text("".join(f"{hashlib.file_digest(p.open('rb'), 'sha256').hexdigest()}  {p.name}\n" for p in outputs), encoding="utf-8")
+    manifest = []
+    for path in outputs:
+        with path.open("rb") as stream:
+            manifest.append(f"{hashlib.file_digest(stream, 'sha256').hexdigest()}  {path.name}\n")
+    sums.write_text("".join(manifest), encoding="utf-8")
     print(json.dumps({"files": [str(p.resolve()) for p in outputs + [sums]], "archive_layouts_verified": True}, indent=2))
 
 

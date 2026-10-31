@@ -1,8 +1,27 @@
 use std::{env, path::PathBuf, process::Command};
 
+#[path = "build_support/windows_resources.rs"]
+mod windows_resources;
+
 fn main() {
     println!("cargo:rerun-if-changed=assets/neontrace.ico");
     println!("cargo:rerun-if-changed=assets/neontrace.rc");
+    println!("cargo:rerun-if-changed=assets/neontrace.manifest");
+    println!("cargo:rerun-if-changed=build_support/windows_resources.rs");
+    for variable in [
+        "RC",
+        "WINDRES",
+        "PATH",
+        "INCLUDE",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
+        "VCToolsVersion",
+        "VCINSTALLDIR",
+        "VSINSTALLDIR",
+        "VSCMD_ARG_TGT_ARCH",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -25,14 +44,49 @@ fn main() {
         println!("cargo:rustc-link-arg={}", resource.display());
     } else {
         let resource = out.join("neontrace.res");
-        let compiler = env::var("RC").unwrap_or_else(|_| "rc.exe".into());
-        let status = Command::new(compiler)
-            .args(["/nologo", "/Iassets", "/fo"])
-            .arg(&resource)
-            .arg("assets/neontrace.rc")
-            .status()
-            .expect("Windows SDK resource compiler rc.exe is required");
-        assert!(status.success(), "Windows resource compilation failed");
+        let target = env::var("TARGET").expect("TARGET");
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH");
+        // A normal PowerShell session does not have the Windows SDK on PATH.
+        // Locate it through the same registry/Visual Studio discovery used by cc,
+        // and retain its INCLUDE/PATH setup as well as the executable path.
+        let discovered = find_msvc_tools::find(&target, "rc.exe");
+        let sdk = find_msvc_tools::find_windows_sdk(&arch);
+        let sdk_compiler = sdk.as_ref().and_then(|sdk| {
+            sdk.path()
+                .map(|path| path.join("rc.exe"))
+                .find(|path| path.is_file())
+        });
+        let includes: Vec<_> = sdk
+            .as_ref()
+            .into_iter()
+            .flat_map(|sdk| sdk.include().map(PathBuf::from))
+            .collect();
+        let mut command = windows_resources::resource_command(
+            env::var_os("RC"),
+            discovered,
+            sdk_compiler,
+            &includes,
+            &resource,
+        );
+        let compiler = command.get_program().to_string_lossy().into_owned();
+        let status = command.status().unwrap_or_else(|error| {
+            panic!(
+                "Could not run Windows resource compiler '{compiler}': {error}. \
+                 Install Visual Studio Build Tools with 'Desktop development with C++' \
+                 and a Windows 10 or 11 SDK, then run cargo build --release again. \
+                 An installed SDK is detected automatically; alternatively run from \
+                 Developer PowerShell for Visual Studio or set RC to the full path \
+                 of rc.exe. If RC is set, check that it names an executable without \
+                 surrounding quotes or command-line arguments."
+            )
+        });
+        assert!(
+            status.success(),
+            "Windows resource compiler '{compiler}' failed with {status}. \
+             See its diagnostic above; ensure the Windows SDK headers are installed. \
+             If using a custom SDK, run from its Developer PowerShell or set \
+             WindowsSdkDir and WindowsSDKVersion."
+        );
         println!("cargo:rustc-link-arg={}", resource.display());
     }
 }

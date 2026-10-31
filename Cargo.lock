@@ -2224,11 +2224,12 @@ dependencies = [
 
 [[package]]
 name = "neontrace"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "csv",
  "dirs",
+ "find-msvc-tools",
  "flate2",
  "fs2",
  "iced",

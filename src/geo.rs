@@ -99,7 +99,6 @@ pub enum AddressFamily {
 #[derive(Debug, Clone)]
 pub struct OriginEstimate {
     pub address: IpAddr,
-    pub discovered_unix: u64,
     pub location: GeoLocation,
 }
 
@@ -112,20 +111,9 @@ pub enum GeoEvent {
         received: u64,
         total: Option<u64>,
     },
-    Validating {
-        kind: DatasetKind,
-    },
-    Installed {
-        edition: DatasetEdition,
-    },
-    Ready {
-        editions: Vec<DatasetEdition>,
-    },
-    Failed {
-        code: &'static str,
-        detail: String,
-        usable_cache: bool,
-    },
+    Validating,
+    Ready,
+    Failed,
     Cancelled,
 }
 #[derive(Debug, Clone)]
@@ -346,7 +334,6 @@ impl GeoService {
                 }
                 Ok(OriginEstimate {
                     address,
-                    discovered_unix: now(),
                     location: self.lookup(address, "en"),
                 })
             };
@@ -386,21 +373,9 @@ impl GeoService {
         emit(&progress, GeoEvent::Checking);
         let result = self.refresh_inner(cancel.clone(), &progress).await;
         match &result {
-            Ok(editions) => emit(
-                &progress,
-                GeoEvent::Ready {
-                    editions: editions.clone(),
-                },
-            ),
+            Ok(_) => emit(&progress, GeoEvent::Ready),
             Err(e) if e.code == "cancelled" => emit(&progress, GeoEvent::Cancelled),
-            Err(e) => emit(
-                &progress,
-                GeoEvent::Failed {
-                    code: e.code,
-                    detail: e.detail.clone(),
-                    usable_cache: self.ready(),
-                },
-            ),
+            Err(_) => emit(&progress, GeoEvent::Failed),
         }
         result
     }
@@ -439,7 +414,7 @@ impl GeoService {
             let _cleanup = StageGuard(vec![compressed.clone(), expanded.clone()]);
             download(&client, &published, &compressed, &cancel, progress).await?;
             cancelled(&cancel)?;
-            emit(progress, GeoEvent::Validating { kind });
+            emit(progress, GeoEvent::Validating);
             let compressed_job = compressed.clone();
             let expanded_job = expanded.clone();
             let cancel_job = cancel.clone();
@@ -508,7 +483,6 @@ impl GeoService {
                 }
             }
             prune_generations(&self.inner.directory, kind);
-            emit(progress, GeoEvent::Installed { edition });
         }
         let checked = now();
         let check_path = self.inner.directory.join(format!("checked-{checked}.json"));

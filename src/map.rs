@@ -12,6 +12,7 @@ pub type MapPoint = (f32, f32);
 
 #[derive(Debug)]
 pub struct Polygon {
+    #[cfg(test)]
     pub country: String,
     /// First ring is the exterior. Further rings retain source holes.
     pub rings: Vec<Vec<MapPoint>>,
@@ -60,8 +61,13 @@ fn decode(mut bytes: &[u8]) -> Geometry {
     let land = (0..count)
         .map(|_| {
             let length = n(&mut bytes);
-            let country = String::from_utf8(take(&mut bytes, length).to_vec()).unwrap();
+            let name = take(&mut bytes, length);
+            #[cfg(test)]
+            let country = String::from_utf8(name.to_vec()).unwrap();
+            #[cfg(not(test))]
+            let _ = name;
             Polygon {
+                #[cfg(test)]
                 country,
                 rings: lines(&mut bytes),
             }

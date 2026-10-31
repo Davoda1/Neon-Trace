@@ -1,4 +1,4 @@
-NEONTRACE 1.0.0
+NEONTRACE 1.1.0
 Native visual ping and route explorer
 Copyright (c) 2026 Davoda1
 
@@ -19,7 +19,9 @@ by this package is the regular native executable /usr/bin/neontrace.
 Enter a hostname, IPv4/IPv6 address, or URL. A pasted URL supplies only its
 hostname; its page is not downloaded. Start pins the chosen resolved address,
 begins endpoint measurements, and independently discovers an initial route.
-Stop retains results for inspection. Trace again refreshes the snapshot.
+Stop retains results for inspection. Clear returns the stopped UI to its initial
+state and keeps preferences, databases and saved history. Trace again refreshes
+the snapshot.
 Replay affects only the retained visualization. A detected local network route
 change stops the current group and marks its origin stale; Start begins a fresh
 session so observations from different networks are not stitched together.
@@ -29,21 +31,28 @@ the latest 16 previous route snapshots are retained separately. Counts and
 averages share that bounded sample window. History retains at most 100 saved
 records and 32 MiB.
 
-Concurrent mode configures one to ten validated targets. Its compact view
-suppresses detailed bottom hop bars while retaining per-target measurements.
+Concurrent mode configures one to ten validated targets, starting with an empty
+entry. Its full-width map and progress cards emphasize simultaneous animated
+connections. Select a card or marker for measurements and observed hops.
 Switching back stops group work. Ordinary relaunch starts measurements stopped.
 
 OFFLINE DEMONSTRATION
 The labelled offline demonstration contains fictional observations. It sends
 no network requests and requires no downloaded location database. The Preview
-HTML is also a fictional, offline visual demonstration rather than a native
-application or record of a real route.
+HTML is a simplified offline browser illustration, not the native application.
+Entered names are labels only; no DNS, ping or geolocation lookup is performed.
 
 MEASUREMENTS AND ANIMATION
-Every complete displayed outbound journey lasts eight seconds. Green travel,
-arrival effects, and single-target hop-bar fills share that presentation
+Every complete displayed outbound journey lasts eight seconds and repeats
+until paused. Shorter drawn jumps take less time; longer ones take more.
+Travel, arrival effects, and single-target hop-bar fills share that presentation
 timeline. Eight seconds is not a probe timeout, RTT, or discovery deadline.
 There is no animation speed selector or reverse-path animation.
+
+The journey strip follows the active hop when it moves out of view. Hovering
+over the strip or scrolling manually suspends following; it resumes four
+seconds after interaction. Pausing stops following. Reduced rendering effects
+uses immediate visibility adjustments instead of animated scrolling.
 
 Endpoint ICMP measures round-trip delay. Separate TTL/hop-limit observations
 can reveal responding interfaces; intermediate routers may not reply. A
@@ -59,9 +68,17 @@ optional TCP port 443 check is not ICMP or a full website health test.
 
 APPEARANCE AND LOCALIZATION
 The operating system controls light/dark appearance, including changes while
-running; there is no override. The sole Simplemaps Robinson map is fitted
-without cropping or distortion. English is the default; German, Hungarian,
-French, Italian, and Russian are also provided.
+running; there is no override. The sole Simplemaps Robinson map automatically
+frames the visible route without distortion, with surrounding geography and a
+limited zoom level. With no located route it shows the world. Hold Ctrl and
+scroll to zoom, or Ctrl and drag to move the map. Horizontal movement wraps;
+vertical movement is limited. Fit route restores automatic framing. English
+is the default; German, Hungarian, French, Italian, and Russian are also
+provided.
+
+The normal window size and position are remembered separately from maximized
+state, so reopening restores the chosen placement without saving minimized
+dimensions. On Wayland, the desktop compositor controls window placement.
 
 DATA AND PRIVACY
 First live use discovers the public network egress address through ipify
@@ -91,13 +108,13 @@ An incomplete route is not converted into a successful demonstration.
 Do not run the whole GUI as root to conceal diagnostic permission errors.
 
 RELEASE SET AND INTEGRITY
-1. NeonTrace-1.0.0-Windows-x64.zip
-2. NeonTrace-1.0.0-Linux-amd64.tar.gz
-3. NeonTrace-1.0.0-Linux-amd64.deb
-4. NeonTrace-1.0.0-Source.zip
-5. NeonTrace-1.0.0-Source.tar.gz
-6. NeonTrace-1.0.0-Preview.html
-7. NeonTrace-1.0.0-README-Notes.txt
+1. NeonTrace-1.1.0-Windows-x64.zip
+2. NeonTrace-1.1.0-Linux-amd64.tar.gz
+3. NeonTrace-1.1.0-Linux-amd64.deb
+4. NeonTrace-1.1.0-Source.zip
+5. NeonTrace-1.1.0-Source.tar.gz
+6. NeonTrace-1.1.0-Preview.html
+7. NeonTrace-1.1.0-README-Notes.txt
 8. SHA256SUM.txt
 
 The single SHA256SUM.txt covers the other seven release files. There are no

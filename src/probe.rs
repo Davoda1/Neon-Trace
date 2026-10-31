@@ -266,6 +266,7 @@ impl ProbeManager {
     pub fn try_recv(&mut self) -> Option<ProbeEvent> {
         self.receiver.try_recv().ok()
     }
+    #[cfg(test)]
     pub fn active_count(&self) -> usize {
         self.controls.len()
     }
