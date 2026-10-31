@@ -112,6 +112,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,6 +135,16 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as env:
               env.write(f'RELEASE_VERSION={version}\n')
           PY
+      - name: Require release source on master
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          git fetch origin refs/heads/master:refs/remotes/origin/master
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/master; then
+            echo "::error::The release commit is not on master. Merge or push it to master, then rerun this workflow."
+            exit 1
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: neontrace-Linux
@@ -179,28 +190,14 @@ jobs:
           assert len(expected) == 8 and actual == expected, 'Uploaded release assets are incomplete'
           PY
           echo "publish=true" >> "$GITHUB_OUTPUT"
-      - name: Fast-forward master when permitted
-        continue-on-error: true
+      - name: Start master checks
+        if: steps.assets.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh auth setup-git
-          git fetch origin master
-          release_commit="$(git rev-parse HEAD)"
-          master_commit="$(git rev-parse origin/master)"
-          if [ "$master_commit" != "$release_commit" ]; then
-            if ! git merge-base --is-ancestor "$master_commit" "$release_commit"; then
-              echo "::warning::master has advanced beyond this release; it will not be overwritten."
-              echo "master was not changed because it has advanced beyond the release commit." >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-            if ! git push origin "$release_commit:refs/heads/master"; then
-              echo "::warning::master promotion needs a maintainer with the required repository permissions."
-              echo "The tested tag is ready. A maintainer must fast-forward master to $release_commit using the repository's required permissions." >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-          fi
+          # A workflow_dispatch event starts CI even when master was updated by GITHUB_TOKEN.
+          gh workflow run verify.yml --ref master
       - name: Publish validated release
         if: steps.assets.outputs.publish == 'true'
         env:
